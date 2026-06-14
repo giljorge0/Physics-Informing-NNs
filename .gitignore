@@ -1,0 +1,11 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local results (let the user generate these fresh)
+results/
+
+# Virtual environments
+venv/
+.venv/
+.env
