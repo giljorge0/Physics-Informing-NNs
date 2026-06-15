@@ -1,0 +1,23 @@
+Physics-Informing Neural Network -- Experiment Summary
+=======================================================
+
+True hidden term: eps*x^3 + delta*sign(v)*v^2
+  eps = 0.4, delta = 0.15
+
+Recovered symbolic expression (from PINN residual): 0.8765*x + -0.9051*x^3 + 0.3577*v + 0.3654*v^3 + -0.5172*sign(v)*v^2 + -0.8312*x*v^2
+R^2 of symbolic fit (PINN residual): 0.8914
+MSE(PINN residual vs true missing term): 9.7141e-03
+
+Oracle check (distilling TRUE missing term directly):
+  Recovered: 0.4000*x^3 + 0.1500*sign(v)*v^2
+  R^2: 1.0000
+
+Final adaptive lambda_i values:
+  inertia: 0.0500
+  damping: 0.0500
+  stiffness: 0.0500
+  forcing: 0.0500
+
+Final losses:
+  data loss:    8.5246e-03
+  physics loss: 4.8870e-02
