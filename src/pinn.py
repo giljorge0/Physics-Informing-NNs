@@ -1,52 +1,45 @@
 """
-Multidimensional Pareto PINN (MP-PINN)
-=======================================
+Multidimensional Pareto PINN (MP-PINN) — v2
+=============================================
 
-Core idea (from the conceptual proposal):
+Three ideas from the original proposal, now all properly implemented:
 
-Standard PINN loss:
-    L_total = L_data + lambda * L_physics
+1. PHYSICS-INFORMING GAP (working in v1, kept):
+   Train against *incomplete* known physics. The residual that remains
+   is the "supraphysical gap" — handed to SINDy for symbolic distillation.
 
-This module decomposes L_physics into a VECTOR of per-term residuals,
-each with its own weight lambda_i:
+2. MULTIDIMENSIONAL PARETO WEIGHTS (fixed):
+   Per-term lambda_i vector instead of one scalar lambda. The original
+   GradNorm approach saturated immediately. New approach: warmup phase
+   establishes a baseline loss for each physics term; adaptive weights
+   then track *relative progress* of each term vs that baseline.
+   Terms the network struggles with (conflicting with data) get
+   down-weighted. Terms that converge easily stay weighted.
 
-    L_total = L_data
-              + lambda_inertia   * L_inertia      (x'' term, always trusted)
-              + lambda_damping   * L_damping       (c*x' term)
-              + lambda_stiffness * L_stiffness     (k*x term)
+   This opens a strictly larger solution space than any scalar lambda:
+   (lambda_inertia, lambda_damping, lambda_stiffness, lambda_forcing)
+   can reach Pareto-optimal solutions that lie off the 2D scalar curve.
 
-Each lambda_i can be:
-  - fixed (user-specified prior confidence in that physics term), or
-  - adaptive, updated via gradient-norm balancing (a simplified
-    GradNorm/PCGrad-style scheme) so that no single term's gradient
-    dominates training and "uncertain" terms are automatically
-    down-weighted if they conflict with the data.
-
-The NETWORK is allowed to produce "supraphysical" predictions: nothing
-forces the total physics residual to zero. Instead, the residual that
-remains (data fits well, physics doesn't fully) becomes the SIGNAL we
-hand to the symbolic-regression distillation step (sindy_distill.py)
-to discover the missing term.
-
-We additionally train a small "informing" head (the adversarial /
-minimax counterpart) whose job is to predict the *physics residual*
-directly from (x, v, t) -- i.e. it tries to "inform" what physics is
-missing, while the main PINN ("informed" network) tries to fit data
-+ known physics. Both are trained jointly; the informing head's output
-is exactly the supraphysical gap, ready for symbolic distillation.
+3. MINIMAX ADVERSARIAL PAIR (now real):
+   InformingNet MAXIMISES the residual it can explain.
+   InformedNet MINIMISES total loss (data + physics + correction cost).
+   Alternating gradient updates, like a GAN — not joint training.
+   The informing network is incentivised to find the most compact
+   (regularised) explanation of the missing physics it can, because
+   the L2 penalty on its output costs the informed network.
 """
 
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Optional, Dict, List
 
 import numpy as np
 import torch
 import torch.nn as nn
 
 
-# ----------------------------------------------------------------------
-# Network architectures
-# ----------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────
+# Networks
+# ──────────────────────────────────────────────────────────────────────
 class MLP(nn.Module):
     def __init__(self, in_dim, out_dim, hidden=64, layers=4, activation=nn.Tanh):
         super().__init__()
@@ -61,9 +54,7 @@ class MLP(nn.Module):
 
 
 class InformedNet(nn.Module):
-    """The 'informed' network: x(t) -> predicted state. This is the
-    standard PINN solution network."""
-
+    """Solution network: t -> x(t). The PINN proper."""
     def __init__(self, hidden=64, layers=4):
         super().__init__()
         self.mlp = MLP(1, 1, hidden, layers)
@@ -72,11 +63,22 @@ class InformedNet(nn.Module):
         return self.mlp(t)
 
 
-class InformingNet(nn.Module):
-    """The 'informing' network: (x, v) -> predicted missing-physics
-    residual. This is the adversarial/minimax counterpart that tries
-    to explain away whatever the InformedNet + known physics cannot."""
+class MultiTrajectoryInformedNet(nn.Module):
+    """Solution network conditioned on initial conditions:
+    (t, x0, v0) -> x(t). Enables training across multiple trajectories
+    simultaneously without one dominating the other."""
+    def __init__(self, hidden=64, layers=4):
+        super().__init__()
+        self.mlp = MLP(3, 1, hidden, layers)  # t, x0, v0
 
+    def forward(self, t, x0, v0):
+        inp = torch.cat([t, x0, v0], dim=-1)
+        return self.mlp(inp)
+
+
+class InformingNet(nn.Module):
+    """Adversarial network: (x, v) -> proposed missing-physics correction.
+    In the minimax game this network MAXIMISES what it can explain."""
     def __init__(self, hidden=32, layers=3):
         super().__init__()
         self.mlp = MLP(2, 1, hidden, layers)
@@ -85,196 +87,345 @@ class InformingNet(nn.Module):
         return self.mlp(torch.cat([x, v], dim=-1))
 
 
-# ----------------------------------------------------------------------
-# Decomposed physics residual terms
-# ----------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────
+# Physics
+# ──────────────────────────────────────────────────────────────────────
 @dataclass
 class PhysicsTerms:
-    """Container for individually-weighted residual components of
-    m*x'' + c*x' + k*x - F(t) = 0  (incomplete known physics)."""
+    """Decomposed residual for:  x'' + c*x' + k*x = F0*cos(w_f*t)
+    Each named component gets its own lambda_i."""
     c: float
     k: float
     F0: float
     w_f: float
 
     def residual_components(self, t, x, x_t, x_tt):
-        """Return a dict of named residual tensors (NOT yet squared/weighted)."""
         forcing = self.F0 * torch.cos(self.w_f * t)
         return {
-            "inertia": x_tt,
-            "damping": self.c * x_t,
+            "inertia":   x_tt,
+            "damping":   self.c * x_t,
             "stiffness": self.k * x,
-            "forcing": -forcing,
+            "forcing":   -forcing,
         }
 
-    def total_residual(self, t, x, x_t, x_tt, informing_term=None):
+    def total_residual(self, t, x, x_t, x_tt):
         comps = self.residual_components(t, x, x_t, x_tt)
-        r = comps["inertia"] + comps["damping"] + comps["stiffness"] + comps["forcing"]
-        if informing_term is not None:
-            r = r + informing_term  # the informing net's proposed correction
-        return r, comps
+        return sum(comps.values()), comps
 
 
-# ----------------------------------------------------------------------
-# Adaptive lambda (per-term weight) manager
-# ----------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────
+# Adaptive weights — FIXED version
+# ──────────────────────────────────────────────────────────────────────
 class AdaptiveWeights:
-    """Tracks per-term lambda_i, updated by gradient-norm balancing.
+    """
+    Relative-progress-based adaptive lambda_i.
 
-    Simplified GradNorm: lambda_i is rescaled so that the gradient norm
-    of lambda_i * L_i (w.r.t. shared params) tracks a target ratio
-    relative to L_data's gradient norm. Terms the network "fights"
-    (high uncertainty / conflicting with data) get automatically
-    down-weighted.
+    Key idea: at the end of warmup, record a baseline loss for each
+    physics term. Then adapt lambda_i so that terms making LESS relative
+    progress (ratio L_i_now / L_i_baseline is still high) get DOWN-
+    weighted — the network is struggling with them, likely because they
+    conflict with the data = missing physics signal.
+
+    Terms the network handles easily (ratio drops fast) stay weighted
+    higher. This is the "different uncertainties about different physics"
+    prior from the proposal, realised automatically from training data.
+
+    lambda_i(t) = lambda_init * (L_i_baseline / L_i_now)^alpha
+
+    alpha controls adaptation strength (0 = no adaptation, 1 = full).
     """
 
-    def __init__(self, term_names, init_lambda=1.0, alpha=0.02, min_lambda=1e-3, max_lambda=10.0):
+    def __init__(self, term_names, init_lambda=0.05, alpha=0.3,
+                 min_lambda=1e-4, max_lambda=2.0, ema_beta=0.95):
         self.term_names = term_names
-        self.lambdas = {name: init_lambda for name in term_names}
+        self.init_lambda = init_lambda
         self.alpha = alpha
         self.min_lambda = min_lambda
         self.max_lambda = max_lambda
-        self.history = {name: [] for name in term_names}
+        self.ema_beta = ema_beta  # smooth the per-term losses before adapting
 
-    def update(self, grad_norms: dict, data_grad_norm: float):
-        """grad_norms: {term_name: ||grad(lambda_i * L_i)||}"""
-        eps = 1e-8
+        self.lambdas = {n: init_lambda for n in term_names}
+        self.baselines: Optional[Dict[str, float]] = None
+        self.ema_losses = {n: None for n in term_names}
+        self.history = {n: [] for n in term_names}
+
+    def set_baselines(self, per_term_losses: Dict[str, float]):
+        """Call once at end of warmup with the current per-term losses."""
+        self.baselines = {n: max(v, 1e-8) for n, v in per_term_losses.items()}
+        self.ema_losses = dict(self.baselines)
+        print(f"[AdaptiveWeights] baselines set: "
+              f"{', '.join(f'{k}={v:.3e}' for k,v in self.baselines.items())}")
+
+    def update(self, per_term_losses: Dict[str, float]):
+        """Update lambdas based on relative progress since baseline."""
+        if self.baselines is None:
+            return
         for name in self.term_names:
-            target = data_grad_norm
-            current = grad_norms.get(name, eps) + eps
-            ratio = target / current
-            new_lambda = self.lambdas[name] * (1 - self.alpha) + self.lambdas[name] * ratio * self.alpha
-            self.lambdas[name] = float(np.clip(new_lambda, self.min_lambda, self.max_lambda))
+            L_now = per_term_losses.get(name, 1e-8)
+            # EMA smoothing to avoid noisy single-step jumps
+            if self.ema_losses[name] is None:
+                self.ema_losses[name] = L_now
+            else:
+                self.ema_losses[name] = (self.ema_beta * self.ema_losses[name]
+                                         + (1 - self.ema_beta) * L_now)
+            ratio = self.baselines[name] / (self.ema_losses[name] + 1e-8)
+            # If ratio > 1: term has improved → keep or increase weight
+            # If ratio < 1: term got worse?? → decrease weight (shouldn't happen often)
+            new_lam = self.init_lambda * (ratio ** self.alpha)
+            self.lambdas[name] = float(np.clip(new_lam, self.min_lambda, self.max_lambda))
             self.history[name].append(self.lambdas[name])
 
     def as_dict(self):
         return dict(self.lambdas)
 
 
-# ----------------------------------------------------------------------
-# Training loop
-# ----------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────────────────────────────
 @dataclass
 class TrainConfig:
-    epochs: int = 4000
+    epochs: int = 5000
     lr: float = 1e-3
-    adaptive: bool = True
+    warmup_epochs: int = 2000
+
+    # Lambda mode: "fixed", "adaptive", or "sweep" (set externally)
+    adaptive: bool = False
     lambda_init: dict = field(default_factory=lambda: {
-        "inertia": 1.0, "damping": 1.0, "stiffness": 1.0, "forcing": 1.0,
+        "inertia": 0.05, "damping": 0.05, "stiffness": 0.05, "forcing": 0.05,
     })
-    lambda_fixed: dict = None  # if set (and adaptive=False), use these fixed values
-    use_informing_net: bool = True
-    informing_weight: float = 0.01  # regularizer keeping informing net small
+    lambda_fixed: dict = None  # used when adaptive=False
+
+    # Adaptive hyperparams
+    adaptive_alpha: float = 0.3     # adaptation strength
+    adaptive_ema: float = 0.95      # EMA smoothing factor
+
+    # Minimax adversarial pair
+    use_informing_net: bool = False
+    adversarial: bool = False       # True = real alternating minimax
+    informing_lr: float = 5e-4
+    informing_steps: int = 1        # inner steps per outer step
+    informing_reg: float = 0.05     # L2 penalty on informing output
+
+    # Multi-trajectory
+    multi_trajectory: bool = False  # use MultiTrajectoryInformedNet
+
     print_every: int = 500
-    warmup_epochs: int = 500
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Main training function
+# ──────────────────────────────────────────────────────────────────────
 def train(t_data, x_data, physics_terms: PhysicsTerms, t_collocation,
-          config: TrainConfig = TrainConfig(), device="cpu"):
+          config: TrainConfig = None, device="cpu",
+          extra_trajectories=None):
+    """
+    Train the MP-PINN.
 
-    t_data_t = torch.tensor(t_data, dtype=torch.float32, device=device).reshape(-1, 1)
-    x_data_t = torch.tensor(x_data, dtype=torch.float32, device=device).reshape(-1, 1)
-    t_col = torch.tensor(t_collocation, dtype=torch.float32, device=device).reshape(-1, 1)
+    extra_trajectories: list of (t, x) pairs for multi-trajectory mode.
+    Returns dict with trained networks, histories, weights object.
+    """
+    if config is None:
+        config = TrainConfig()
+
+    term_names = ["inertia", "damping", "stiffness", "forcing"]
+
+    # ── tensors ──────────────────────────────────────────────────────
+    def to_t(arr):
+        return torch.tensor(arr, dtype=torch.float32, device=device).reshape(-1, 1)
+
+    t_data_t = to_t(t_data)
+    x_data_t = to_t(x_data)
+    t_col = to_t(t_collocation)
     t_col.requires_grad_(True)
 
+    # ── networks ─────────────────────────────────────────────────────
     informed = InformedNet().to(device)
     informing = InformingNet().to(device) if config.use_informing_net else None
 
-    params = list(informed.parameters())
-    if informing is not None:
-        params += list(informing.parameters())
-    optimizer = torch.optim.Adam(params, lr=config.lr)
+    # ── optimisers ───────────────────────────────────────────────────
+    if config.adversarial and informing is not None:
+        # Separate optimisers for the minimax game
+        opt_informed  = torch.optim.Adam(informed.parameters(),  lr=config.lr)
+        opt_informing = torch.optim.Adam(informing.parameters(), lr=config.informing_lr)
+    else:
+        params = list(informed.parameters())
+        if informing is not None:
+            params += list(informing.parameters())
+        opt_informed = torch.optim.Adam(params, lr=config.lr)
+        opt_informing = None
 
-    term_names = ["inertia", "damping", "stiffness", "forcing"]
+    # ── weights ──────────────────────────────────────────────────────
     if config.adaptive:
-        weights = AdaptiveWeights(term_names, init_lambda=1.0)
+        weights = AdaptiveWeights(
+            term_names,
+            init_lambda=list(config.lambda_init.values())[0],  # use first as init
+            alpha=config.adaptive_alpha,
+            ema_beta=config.adaptive_ema,
+        )
+        baselines_set = False
     else:
         weights = None
+        baselines_set = True
         fixed = config.lambda_fixed or config.lambda_init
 
+    # ── history ──────────────────────────────────────────────────────
     loss_history = {"data": [], "physics": [], "total": []}
-    lambda_history = {name: [] for name in term_names}
+    lambda_history = {n: [] for n in term_names}
 
+    # ── training loop ────────────────────────────────────────────────
     for epoch in range(config.epochs):
-        optimizer.zero_grad()
+        warm = epoch < config.warmup_epochs
 
-        # --- data loss ---
+        # ── compute physics residual at collocation points ──────────
+        # Need fresh computation with graph for backward
+        t_col_var = t_col  # already requires grad
+
+        x_col = informed(t_col_var)
+        x_t_col = torch.autograd.grad(
+            x_col, t_col_var, grad_outputs=torch.ones_like(x_col),
+            create_graph=True)[0]
+        x_tt_col = torch.autograd.grad(
+            x_t_col, t_col_var, grad_outputs=torch.ones_like(x_t_col),
+            create_graph=True)[0]
+
+        comps = physics_terms.residual_components(t_col_var, x_col, x_t_col, x_tt_col)
+        per_term_loss = {n: torch.mean(comps[n] ** 2) for n in term_names}
+
+        # ── informing net output ─────────────────────────────────────
+        informing_term = None
+        if informing is not None:
+            informing_term = informing(x_col.detach(), x_t_col.detach())
+
+        # ── data loss ────────────────────────────────────────────────
         x_pred_data = informed(t_data_t)
         loss_data = torch.mean((x_pred_data - x_data_t) ** 2)
 
-        # --- physics loss (collocation points) ---
-        x_pred = informed(t_col)
-        x_t = torch.autograd.grad(x_pred, t_col, grad_outputs=torch.ones_like(x_pred),
-                                    create_graph=True)[0]
-        x_tt = torch.autograd.grad(x_t, t_col, grad_outputs=torch.ones_like(x_t),
-                                     create_graph=True)[0]
+        # ── warmup: data only ────────────────────────────────────────
+        if warm:
+            opt_informed.zero_grad()
+            loss_data.backward()
+            opt_informed.step()
 
-        informing_term = None
-        if informing is not None:
-            informing_term = informing(x_pred, x_t)
+            loss_history["data"].append(loss_data.item())
+            loss_history["physics"].append(0.0)
+            loss_history["total"].append(loss_data.item())
+            for n in term_names:
+                lambda_history[n].append(0.0)
 
-        comps = physics_terms.residual_components(t_col, x_pred, x_t, x_tt)
+            if epoch % config.print_every == 0:
+                print(f"[epoch {epoch:5d}] WARMUP  data={loss_data.item():.3e}")
+            continue
 
-        per_term_loss = {}
-        for name in term_names:
-            per_term_loss[name] = torch.mean(comps[name] ** 2)
+        # ── end of warmup: set adaptive baselines ────────────────────
+        if config.adaptive and not baselines_set:
+            weights.set_baselines({n: per_term_loss[n].item() for n in term_names})
+            baselines_set = True
 
-        # full residual including informing-net correction
+        # ── determine lambdas ────────────────────────────────────────
+        if config.adaptive:
+            weights.update({n: per_term_loss[n].item() for n in term_names})
+            lambdas_now = weights.as_dict()
+        else:
+            lambdas_now = fixed
+
+        # ── physics loss ─────────────────────────────────────────────
+        loss_physics = sum(lambdas_now[n] * per_term_loss[n] for n in term_names)
+
+        # ── total residual for closure regulariser ───────────────────
         full_residual = sum(comps.values())
         if informing_term is not None:
+            # In adversarial mode: informing net's correction offsets the residual
             full_residual = full_residual + informing_term
-        loss_residual = torch.mean(full_residual ** 2)
+        loss_closure = torch.mean(full_residual ** 2)
 
-        warm = epoch < config.warmup_epochs
-        if warm:
-            loss_total = loss_data
-            loss_physics = loss_residual.detach() * 0.0  # placeholder, zero
-            lambdas_now = {n: 0.0 for n in term_names}
+        # ════════════════════════════════════════════════════════════
+        # MINIMAX ADVERSARIAL UPDATE
+        # ════════════════════════════════════════════════════════════
+        if config.adversarial and informing is not None:
+            # ── Step A: Update InformedNet (informing fixed) ─────────
+            # Minimise: L_data + L_physics + reg * ||informing_term||²
+            # The regulariser on informing_term penalises the informed net
+            # for "accepting" large corrections from the informing net.
+            loss_informed = (loss_data
+                             + loss_physics
+                             + 0.1 * loss_closure
+                             + config.informing_reg * torch.mean(informing_term ** 2))
+
+            opt_informed.zero_grad()
+            loss_informed.backward(retain_graph=True)
+            opt_informed.step()
+
+            # ── Step B: Update InformingNet (informed fixed) ─────────
+            # The informing net wants to MAXIMISE how much of the residual
+            # it can explain, but is penalised for being large (Occam's razor).
+            # 
+            # Residual without informing correction:
+            raw_residual = sum(comps.values()).detach()
+            # Informing net proposes a correction:
+            x_col_d  = x_col.detach()
+            x_t_col_d = x_t_col.detach()
+            correction = informing(x_col_d, x_t_col_d)
+            # After correction, the net residual is (raw_residual + correction).
+            # InformingNet MINIMISES: ||raw_residual + correction||² + reg*||correction||²
+            # This is equivalent to maximising how much it explains while staying small.
+            residual_after = raw_residual + correction
+            loss_informing = (torch.mean(residual_after ** 2)
+                              + config.informing_reg * torch.mean(correction ** 2))
+
+            for _ in range(config.informing_steps):
+                opt_informing.zero_grad()
+                # Recompute for each inner step
+                correction = informing(x_col_d, x_t_col_d)
+                residual_after = raw_residual + correction
+                loss_informing = (torch.mean(residual_after ** 2)
+                                  + config.informing_reg * torch.mean(correction ** 2))
+                loss_informing.backward()
+                opt_informing.step()
+
+            loss_total = loss_informed.detach()
+            loss_phys_val = loss_physics.item()
+
+        # ════════════════════════════════════════════════════════════
+        # JOINT TRAINING (non-adversarial)
+        # ════════════════════════════════════════════════════════════
         else:
-            # --- adaptive weight update via gradient norms ---
-            if config.adaptive:
-                grad_norms = {}
-                data_grad_norm = _grad_norm(loss_data, params)
-                for name in term_names:
-                    lam = weights.lambdas[name]
-                    grad_norms[name] = _grad_norm(lam * per_term_loss[name], params)
-                weights.update(grad_norms, data_grad_norm)
-                lambdas_now = weights.as_dict()
-            else:
-                lambdas_now = fixed
-
-            loss_physics = sum(lambdas_now[name] * per_term_loss[name] for name in term_names)
-            loss_physics = loss_physics + 0.1 * loss_residual  # light residual-closure regularizer
-
-            loss_total = loss_data + loss_physics
+            loss_total = loss_data + loss_physics + 0.1 * loss_closure
             if informing is not None:
-                loss_total = loss_total + config.informing_weight * torch.mean(informing_term ** 2)
+                loss_total = loss_total + config.informing_reg * torch.mean(informing_term ** 2)
 
-        loss_total.backward()
-        optimizer.step()
+            opt_informed.zero_grad()
+            loss_total.backward()
+            opt_informed.step()
+            loss_phys_val = loss_physics.item()
 
+        # ── history ──────────────────────────────────────────────────
         loss_history["data"].append(loss_data.item())
-        loss_history["physics"].append(loss_physics.item())
-        loss_history["total"].append(loss_total.item())
-        for name in term_names:
-            lambda_history[name].append(lambdas_now[name])
+        loss_history["physics"].append(loss_phys_val)
+        loss_history["total"].append(loss_total.item() if hasattr(loss_total, 'item') else float(loss_total))
+        for n in term_names:
+            lambda_history[n].append(lambdas_now[n])
 
         if epoch % config.print_every == 0 or epoch == config.epochs - 1:
-            print(f"[epoch {epoch:5d}] data={loss_data.item():.3e} "
-                  f"physics={loss_physics.item():.3e} "
-                  f"lambdas={{{', '.join(f'{k}:{v:.3f}' for k,v in lambdas_now.items())}}}")
+            lam_str = ', '.join(f'{k}:{v:.4f}' for k, v in lambdas_now.items())
+            mode = "ADV" if (config.adversarial and informing) else "joint"
+            print(f"[epoch {epoch:5d}|{mode}] data={loss_data.item():.3e} "
+                  f"phys={loss_phys_val:.3e} λ={{{lam_str}}}")
 
     return {
-        "informed": informed,
-        "informing": informing,
-        "loss_history": loss_history,
+        "informed":       informed,
+        "informing":      informing,
+        "loss_history":   loss_history,
         "lambda_history": lambda_history,
-        "weights": weights,
+        "weights":        weights,
     }
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────
 def _grad_norm(loss, params):
-    grads = torch.autograd.grad(loss, params, retain_graph=True, create_graph=False, allow_unused=True)
+    grads = torch.autograd.grad(loss, params, retain_graph=True,
+                                create_graph=False, allow_unused=True)
     total = 0.0
     for g in grads:
         if g is not None:
@@ -282,20 +433,16 @@ def _grad_norm(loss, params):
     return total ** 0.5
 
 
-# ----------------------------------------------------------------------
-# Convenience: extract residuals at arbitrary points for distillation
-# ----------------------------------------------------------------------
-def evaluate_supraphysical_residual(informed, physics_terms: PhysicsTerms, t_array, device="cpu"):
-    """Compute the 'supraphysical gap': what the network's solution implies
-    is missing from the known physics, i.e.
-        residual(t) = x'' + c*x' + k*x - F(t)
-    evaluated using the trained network's x(t). This residual should
-    approximate eps*x^3 + delta*sign(v)*v^2 from the true system."""
+def evaluate_supraphysical_residual(informed, physics_terms: PhysicsTerms,
+                                    t_array, device="cpu"):
+    """Return (x, v, a, residual) where residual ≈ missing physics term."""
     t = torch.tensor(t_array, dtype=torch.float32, device=device).reshape(-1, 1)
     t.requires_grad_(True)
     x = informed(t)
-    x_t = torch.autograd.grad(x, t, grad_outputs=torch.ones_like(x), create_graph=True)[0]
-    x_tt = torch.autograd.grad(x_t, t, grad_outputs=torch.ones_like(x_t), create_graph=True)[0]
+    x_t  = torch.autograd.grad(x,   t, grad_outputs=torch.ones_like(x),
+                                create_graph=True)[0]
+    x_tt = torch.autograd.grad(x_t, t, grad_outputs=torch.ones_like(x_t),
+                                create_graph=True)[0]
 
     forcing = physics_terms.F0 * torch.cos(physics_terms.w_f * t)
     residual = x_tt + physics_terms.c * x_t + physics_terms.k * x - forcing
@@ -304,5 +451,5 @@ def evaluate_supraphysical_residual(informed, physics_terms: PhysicsTerms, t_arr
         x.detach().cpu().numpy().flatten(),
         x_t.detach().cpu().numpy().flatten(),
         x_tt.detach().cpu().numpy().flatten(),
-        (-residual).detach().cpu().numpy().flatten(),  # missing term ≈ -residual
+        (-residual).detach().cpu().numpy().flatten(),
     )
