@@ -44,7 +44,7 @@ def run_strategy(label, adaptive, lambda_fixed, adaptive_alpha,
         lambda_init={k: lambda_fixed[k] for k in lambda_fixed} if not adaptive else
                     {"inertia":0.05,"damping":0.05,"stiffness":0.05,"forcing":0.05},
         adaptive_alpha=adaptive_alpha,
-        adaptive_ema=0.95,
+        adaptive_ema=0.7,
         use_informing_net=False,
         print_every=1000,
     )
@@ -107,7 +107,7 @@ def main():
         ("C: adaptive (relative-progress)",
          True,
          {"inertia":0.05,"damping":0.05,"stiffness":0.05,"forcing":0.05},
-         0.35),
+         0.7),
     ]
 
     all_results = []
